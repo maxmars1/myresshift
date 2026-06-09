@@ -377,6 +377,7 @@ class GaussianDiffusion:
         model_kwargs=None,
         device=None,
         progress=False,
+        up_sample=True,
     ):
         """
         Generate samples from the model.
@@ -408,6 +409,7 @@ class GaussianDiffusion:
             model_kwargs=model_kwargs,
             device=device,
             progress=progress,
+            up_sample=up_sample,
         ):
             final = sample["sample"]
         with th.no_grad():
@@ -428,6 +430,7 @@ class GaussianDiffusion:
             model_kwargs=None,
             device=None,
             progress=False,
+            up_sample=True,
     ):
         """
         Generate samples from the model and yield intermediate samples from
@@ -439,7 +442,7 @@ class GaussianDiffusion:
         """
         if device is None:
             device = next(model.parameters()).device
-        z_y = self.encode_first_stage(y, first_stage_model, up_sample=True)
+        z_y = self.encode_first_stage(y, first_stage_model, up_sample=up_sample)
 
         # generating noise
         if noise is None:

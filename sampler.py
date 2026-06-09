@@ -34,6 +34,7 @@ class BaseSampler:
             chop_bs=1,
             padding_offset=16,
             seed=10000,
+            no_upscale=False,
             ):
         '''
         Input:
@@ -49,6 +50,7 @@ class BaseSampler:
         self.seed = seed
         self.use_amp = use_amp
         self.padding_offset = padding_offset
+        self.no_upscale = no_upscale
 
         self.setup_dist()  # setup distributed training: self.num_gpus, self.rank
 
@@ -182,13 +184,19 @@ class ResShiftSampler(BaseSampler):
         else:
             flag_pad = False
 
+        if self.no_upscale:
+            # Images already at target resolution: downsample lq to match VQ-VAE latent size
+            lq_cond = F.interpolate(y0, scale_factor=1.0/self.sf, mode='bicubic', antialias=True)
+        else:
+            lq_cond = y0
+
         if self.configs.model.params.cond_lq and mask is not None:
             model_kwargs={
-                    'lq':y0,
+                    'lq': lq_cond,
                     'mask': mask,
                     }
         elif self.configs.model.params.cond_lq:
-            model_kwargs={'lq':y0,}
+            model_kwargs={'lq': lq_cond,}
         else:
             model_kwargs = None
 
@@ -202,10 +210,12 @@ class ResShiftSampler(BaseSampler):
                 denoised_fn=None,
                 model_kwargs=model_kwargs,
                 progress=False,
+                up_sample=not self.no_upscale,
                 )    # This has included the decoding for latent space
 
+        out_sf = 1 if self.no_upscale else self.sf
         if flag_pad:
-            results = results[:, :, :ori_h*self.sf, :ori_w*self.sf]
+            results = results[:, :, :ori_h*out_sf, :ori_w*out_sf]
 
         return results.clamp_(-1.0, 1.0)
 
@@ -235,7 +245,7 @@ class ResShiftSampler(BaseSampler):
                         im_lq_tensor,
                         self.chop_size,
                         stride=self.chop_stride,
-                        sf=self.sf,
+                        sf=1 if self.no_upscale else self.sf,
                         extra_bs=self.chop_bs,
                         )
                 for im_lq_pch, index_infos in im_spliter:

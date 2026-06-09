@@ -1,206 +1,112 @@
 #!/usr/bin/env python
 # -*- coding:utf-8 -*-
-# Power by Zongsheng Yue 2023-03-11 17:17:41
+# 4K SR enhancement using ResShift v3 (4-step).
+# LQ images are already bicubic-upscaled to 4K; this script adds high-frequency
+# details without downscaling, by disabling the internal bicubic upsampling step.
 
 import os, sys
-import argparse
+from PIL import Image
 from pathlib import Path
 
 from omegaconf import OmegaConf
 from sampler import ResShiftSampler
 
-from utils.util_opts import str2bool
-from basicsr.utils.download_util import load_file_from_url
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+SCRIPT_DIR = Path(__file__).parent
+LQ_DIR     = SCRIPT_DIR.parent / 'data' / 'lq'
+OUT_DIR    = SCRIPT_DIR.parent / 'data' / 'sr'
 
-_STEP = {
-    'v1': 15,
-    'v2': 15,
-    'v3': 4,
-    'bicsr': 4,
-    'inpaint_imagenet': 4,
-    'inpaint_face': 4,
-    'faceir': 4,
-    'deblur': 4,
-    }
-_LINK = {
-    'vqgan': 'https://github.com/zsyOAOA/ResShift/releases/download/v2.0/autoencoder_vq_f4.pth',
-    'vqgan_face256': 'https://github.com/zsyOAOA/ResShift/releases/download/v2.0/celeba256_vq_f4_dim3_face.pth',
-    'vqgan_face512': 'https://github.com/zsyOAOA/ResShift/releases/download/v2.0/ffhq512_vq_f8_dim8_face.pth',
-    'v1': 'https://github.com/zsyOAOA/ResShift/releases/download/v2.0/resshift_realsrx4_s15_v1.pth',
-    'v2': 'https://github.com/zsyOAOA/ResShift/releases/download/v2.0/resshift_realsrx4_s15_v2.pth',
-    'v3': 'https://github.com/zsyOAOA/ResShift/releases/download/v2.0/resshift_realsrx4_s4_v3.pth',
-    'bicsr': 'https://github.com/zsyOAOA/ResShift/releases/download/v2.0/resshift_bicsrx4_s4.pth',
-    'inpaint_imagenet': 'https://github.com/zsyOAOA/ResShift/releases/download/v2.0/resshift_inpainting_imagenet_s4.pth',
-    'inpaint_face': 'https://github.com/zsyOAOA/ResShift/releases/download/v2.0/resshift_inpainting_face_s4.pth',
-    'faceir': 'https://github.com/zsyOAOA/ResShift/releases/download/v2.0/resshift_faceir_s4.pth',
-    'deblur': 'https://github.com/zsyOAOA/ResShift/releases/download/v2.0/resshift_deblur_s4.pth',
-     }
+# ---------------------------------------------------------------------------
+# Model weights (v3, 4-step real-SR)
+# ---------------------------------------------------------------------------
+CKPT_PATH  = SCRIPT_DIR / 'weights' / 'resshift_realsrx4_s4_v3.pth'
+VQGAN_PATH = SCRIPT_DIR / 'weights' / 'autoencoder_vq_f4.pth'
+CONFIG     = SCRIPT_DIR / 'configs' / 'realsr_swinunet_realesrgan256_journal.yaml'
 
-def get_parser(**parser_kwargs):
-    parser = argparse.ArgumentParser(**parser_kwargs)
-    parser.add_argument("-i", "--in_path", type=str, default="", help="Input path.")
-    parser.add_argument("-o", "--out_path", type=str, default="./results", help="Output path.")
-    parser.add_argument("--mask_path", type=str, default="", help="Mask path for inpainting.")
-    parser.add_argument("--scale", type=int, default=4, help="Scale factor for SR.")
-    parser.add_argument("--seed", type=int, default=12345, help="Random seed.")
-    parser.add_argument("--bs", type=int, default=1, help="Batch size.")
-    parser.add_argument(
-            "-v",
-            "--version",
-            type=str,
-            default="v1",
-            choices=["v1", "v2", "v3"],
-            help="Checkpoint version.",
-            )
-    parser.add_argument(
-            "--chop_size",
-            type=int,
-            default=512,
-            choices=[512, 256, 64],
-            help="Chopping forward.",
-            )
-    parser.add_argument(
-            "--chop_stride",
-            type=int,
-            default=-1,
-            help="Chopping stride.",
-            )
-    parser.add_argument(
-            "--task",
-            type=str,
-            default="realsr",
-            choices=['realsr', 'bicsr', 'inpaint_imagenet', 'inpaint_face', 'faceir', 'deblur'],
-            help="Chopping forward.",
-            )
-    args = parser.parse_args()
+# ---------------------------------------------------------------------------
+# Patch settings for 4K images (already at target resolution, no upscaling)
+# chop_size: patch side length in pixels drawn from the 4K image
+# chop_stride: step between patch origins (overlap = chop_size - chop_stride)
+# ---------------------------------------------------------------------------
+CHOP_SIZE   = 512   # 512-pixel patches → 128×128 VQ latent (matches training depth)
+CHOP_STRIDE = 448   # 64-pixel overlap on each edge for seamless blending
 
-    return args
 
-def get_configs(args):
-    ckpt_dir = Path('./weights')
-    if not ckpt_dir.exists():
-        ckpt_dir.mkdir()
+def build_sampler():
+    configs = OmegaConf.load(str(CONFIG))
+    configs.model.ckpt_path      = str(CKPT_PATH)
+    configs.autoencoder.ckpt_path = str(VQGAN_PATH)
+    configs.diffusion.params.sf  = 4
 
-    if args.task == 'realsr':
-        if args.version in ['v1', 'v2']:
-            configs = OmegaConf.load('./configs/realsr_swinunet_realesrgan256.yaml')
-        elif args.version == 'v3':
-            configs = OmegaConf.load('./configs/realsr_swinunet_realesrgan256_journal.yaml')
-        else:
-            raise ValueError(f"Unexpected version type: {args.version}")
-        assert args.scale == 4, 'We only support the 4x super-resolution now!'
-        ckpt_url = _LINK[args.version]
-        ckpt_path = ckpt_dir / f'resshift_{args.task}x{args.scale}_s{_STEP[args.version]}_{args.version}.pth'
-        vqgan_url = _LINK['vqgan']
-        vqgan_path = ckpt_dir / f'autoencoder_vq_f4.pth'
-    elif args.task == 'bicsr':
-        configs = OmegaConf.load('./configs/bicx4_swinunet_lpips.yaml')
-        assert args.scale == 4, 'We only support the 4x super-resolution now!'
-        ckpt_url = _LINK[args.task]
-        ckpt_path = ckpt_dir / f'resshift_{args.task}x{args.scale}_s{_STEP[args.task]}.pth'
-        vqgan_url = _LINK['vqgan']
-        vqgan_path = ckpt_dir / f'autoencoder_vq_f4.pth'
-    elif args.task == 'inpaint_imagenet':
-        configs = OmegaConf.load('./configs/inpaint_lama256_imagenet.yaml')
-        assert args.scale == 1, 'Please set scale equals 1 for image inpainting!'
-        ckpt_url = _LINK[args.task]
-        ckpt_path = ckpt_dir / f'resshift_{args.task}_s{_STEP[args.task]}.pth'
-        vqgan_url = _LINK['vqgan']
-        vqgan_path = ckpt_dir / f'autoencoder_vq_f4.pth'
-    elif args.task == 'inpaint_face':
-        configs = OmegaConf.load('./configs/inpaint_lama256_face.yaml')
-        assert args.scale == 1, 'Please set scale equals 1 for image inpainting!'
-        ckpt_url = _LINK[args.task]
-        ckpt_path = ckpt_dir / f'resshift_{args.task}_s{_STEP[args.task]}.pth'
-        vqgan_url = _LINK['vqgan_face256']
-        vqgan_path = ckpt_dir / f'celeba256_vq_f4_dim3_face.pth'
-    elif args.task == 'faceir':
-        configs = OmegaConf.load('./configs/faceir_gfpgan512_lpips.yaml')
-        assert args.scale == 1, 'Please set scale equals 1 for face restoration!'
-        ckpt_url = _LINK[args.task]
-        ckpt_path = ckpt_dir / f'resshift_{args.task}_s{_STEP[args.task]}.pth'
-        vqgan_url = _LINK['vqgan_face512']
-        vqgan_path = ckpt_dir / f'ffhq512_vq_f8_dim8_face.pth'
-    elif args.task == 'deblur':
-        configs = OmegaConf.load('./configs/deblur_gopro256.yaml')
-        assert args.scale == 1, 'Please set scale equals 1 for deblurring!'
-        ckpt_url = _LINK[args.task]
-        ckpt_path = ckpt_dir / f'resshift_{args.task}_s{_STEP[args.task]}.pth'
-        vqgan_url = _LINK['vqgan']
-        vqgan_path = ckpt_dir / f'autoencoder_vq_f4.pth'
-    else:
-        raise TypeError(f"Unexpected task type: {args.task}!")
+    assert CKPT_PATH.exists(),  f"Checkpoint not found: {CKPT_PATH}"
+    assert VQGAN_PATH.exists(), f"VQ-GAN weights not found: {VQGAN_PATH}"
 
-    # prepare the checkpoint
-    if not ckpt_path.exists():
-         load_file_from_url(
-            url=ckpt_url,
-            model_dir=ckpt_dir,
-            progress=True,
-            file_name=ckpt_path.name,
-            )
-    if not vqgan_path.exists():
-         load_file_from_url(
-            url=vqgan_url,
-            model_dir=ckpt_dir,
-            progress=True,
-            file_name=vqgan_path.name,
-            )
+    lq_size = configs.model.params.get('lq_size', 64)
 
-    configs.model.ckpt_path = str(ckpt_path)
-    configs.diffusion.params.sf = args.scale
-    configs.autoencoder.ckpt_path = str(vqgan_path)
+    sampler = ResShiftSampler(
+        configs,
+        sf=4,
+        chop_size=CHOP_SIZE,
+        chop_stride=CHOP_STRIDE,
+        chop_bs=1,
+        use_amp=True,
+        seed=12345,
+        padding_offset=lq_size,
+        no_upscale=True,   # images already at 4K; skip internal bicubic upsampling
+    )
+    return sampler
 
-    # save folder
-    if not Path(args.out_path).exists():
-        Path(args.out_path).mkdir(parents=True)
-
-    if args.chop_stride < 0:
-        if args.chop_size == 512:
-            chop_stride = (512 - 64) * (4 // args.scale)
-        elif args.chop_size == 256:
-            chop_stride = (256 - 32) * (4 // args.scale)
-        elif args.chop_size == 64:
-            chop_stride = (64 - 16) * (4 // args.scale)
-        else:
-            raise ValueError("Chop size must be in [512, 256]")
-    else:
-        chop_stride = args.chop_stride * (4 // args.scale)
-    args.chop_size *= (4 // args.scale)
-    print(f"Chopping size/stride: {args.chop_size}/{chop_stride}")
-
-    return configs, chop_stride
 
 def main():
-    args = get_parser()
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    configs, chop_stride = get_configs(args)
+    lq_images = sorted(LQ_DIR.glob('*.jpg'))
+    if not lq_images:
+        print(f"No .jpg images found in {LQ_DIR}")
+        return
 
-    resshift_sampler = ResShiftSampler(
-            configs,
-            sf=args.scale,
-            chop_size=args.chop_size,
-            chop_stride=chop_stride,
-            chop_bs=1,
-            use_amp=True,
-            seed=args.seed,
-            padding_offset=configs.model.params.get('lq_size', 64),
-            )
+    print(f"Found {len(lq_images)} image(s) in {LQ_DIR}")
+    print(f"Patch size: {CHOP_SIZE}px  stride: {CHOP_STRIDE}px  (no internal upscaling)")
 
-    # setting mask path for inpainting
-    if args.task.startswith('inpaint'):
-        assert args.mask_path, 'Please input the mask path for inpainting!'
-        mask_path = args.mask_path
-    else:
-        mask_path = None
+    sampler = build_sampler()
 
-    resshift_sampler.inference(
-            args.in_path,
-            args.out_path,
-            mask_path=mask_path,
-            bs=args.bs,
-            noise_repeat=False
-            )
+    for lq_path in lq_images:
+        stem    = lq_path.stem
+        out_jpg = OUT_DIR / f"{stem}_out.jpg"
+        tmp_png = OUT_DIR / f"{stem}.png"
+
+        print(f"  {lq_path.name}  →  {out_jpg.name}")
+
+        # inference() saves a PNG named <stem>.png into out_dir
+        sampler.inference(
+            str(lq_path),
+            str(OUT_DIR),
+            mask_path=None,
+            bs=1,
+            noise_repeat=False,
+        )
+
+        # Convert the intermediate PNG to *_out.jpg, preserving input EXIF
+        if tmp_png.exists():
+            # Read EXIF bytes from original LQ (includes orientation tag)
+            src = Image.open(str(lq_path))
+            exif_bytes = src.info.get('exif', b'')
+
+            # Load SR result and save as JPEG with original EXIF
+            sr_img = Image.open(str(tmp_png))
+            save_kwargs = {'quality': 95, 'subsampling': 0}
+            if exif_bytes:
+                save_kwargs['exif'] = exif_bytes
+            sr_img.save(str(out_jpg), **save_kwargs)
+            tmp_png.unlink()
+        else:
+
+            print(f"    WARNING: expected output {tmp_png} not found")
+
+    print(f"\nDone. Results saved to {OUT_DIR}")
+
 
 if __name__ == '__main__':
     main()
